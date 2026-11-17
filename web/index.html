@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>skewpipe · 倾斜拆分与安全合并</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%232a78d6'/%3E%3Cpath d='M4 7h5l3 5 3-5h5' fill='none' stroke='white' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 6h6l3 6 3-6h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 18h6l3-6 3 6h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity=".45"/></svg>
+      </span>
+      <div>
+        <h1>倾斜拆分与安全合并</h1>
+        <p class="sub">分布器 → 多个聚合进程 → 结果发布 · 可验证的虚构数据管道</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <span class="inc-chip" id="inc-chip">inc —</span>
+      <button class="icon-btn" id="theme-toggle" title="切换明暗主题" aria-label="切换明暗主题">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3v2m0 14v2M5.2 5.2l1.4 1.4m11.2 11.2 1.4 1.4M3 12h2m14 0h2M5.2 18.8l1.4-1.4M18.8 5.2l-1.4 1.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <section class="controls" aria-label="运行配置">
+    <div class="control-group">
+      <span class="control-label">指标</span>
+      <div class="segmented" id="metric-tabs" role="tablist"></div>
+    </div>
+    <div class="control-group">
+      <label class="control-label" for="mode">分区策略</label>
+      <select id="mode">
+        <option value="naive">朴素哈希分区</option>
+        <option value="preroute">入口预路由</option>
+        <option value="split">运行时拆分重键</option>
+      </select>
+    </div>
+    <div class="control-group" id="strategy-group">
+      <label class="control-label" for="strategy">拆分键策略</label>
+      <select id="strategy">
+        <option value="round_robin">轮转 round-robin</option>
+        <option value="striped">条带 striped</option>
+        <option value="keyed_lane">分组键 keyed</option>
+      </select>
+    </div>
+    <div class="control-group compact">
+      <label class="control-label" for="fanout">拆分片数 <output id="fanout-out">4</output></label>
+      <input type="range" id="fanout" min="2" max="12" value="4" step="1">
+    </div>
+    <div class="control-group compact">
+      <label class="control-label" for="aggs">聚合进程 <output id="aggs-out">4</output></label>
+      <input type="range" id="aggs" min="2" max="8" value="4" step="1">
+    </div>
+    <div class="control-group">
+      <label class="control-label" for="seed">数据种子</label>
+      <input type="number" id="seed" value="7" min="1" max="99999">
+    </div>
+    <div class="control-buttons">
+      <button class="btn primary" id="btn-start">新建运行</button>
+      <button class="btn" id="btn-step">单步</button>
+      <button class="btn" id="btn-play">自动播放</button>
+      <button class="btn" id="btn-finish">跑到结束</button>
+    </div>
+  </section>
+
+  <p class="mode-note" id="mode-note"></p>
+
+  <section class="kpis" aria-label="关键指标">
+    <div class="kpi">
+      <span class="kpi-label">热点键最终结果</span>
+      <span class="kpi-value" id="kpi-result">—</span>
+      <span class="kpi-sub" id="kpi-result-sub">尚未运行</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-label">与真值误差</span>
+      <span class="kpi-value" id="kpi-error">—</span>
+      <span class="kpi-sub" id="kpi-error-sub">发布器按指标规则合并</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-label">最大单进程积压</span>
+      <span class="kpi-value" id="kpi-backlog">—</span>
+      <span class="kpi-sub" id="kpi-backlog-sub">与朴素基准对照</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-label">运行时长</span>
+      <span class="kpi-value" id="kpi-ticks">—</span>
+      <span class="kpi-sub" id="kpi-ticks-sub">虚拟 tick</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-label">拒绝的局部结果</span>
+      <span class="kpi-value" id="kpi-rejected">—</span>
+      <span class="kpi-sub" id="kpi-rejected-sub">异代 / 旧拆分 / 重复</span>
+    </div>
+  </section>
+
+  <div class="grid two">
+    <section class="card" aria-labelledby="skew-title">
+      <div class="card-head">
+        <h2 id="skew-title">倾斜识别</h2>
+        <span class="card-hint">按已观测行数占比判定；≥ 阈值即可拆分</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" id="skew-table">
+          <thead><tr><th>键</th><th class="num">行数</th><th class="num">占比</th><th class="num">单进程耗时</th><th>建议</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="split-controls">
+        <label class="control-label" for="split-key">拆分键</label>
+        <select id="split-key"></select>
+        <button class="btn small" id="btn-split">触发拆分</button>
+        <button class="btn small" id="btn-retrigger" title="用新策略重建拆分任务，旧任务转入 retired">重新拆分</button>
+      </div>
+      <div class="task-list" id="task-list"></div>
+    </section>
+
+    <section class="card" aria-labelledby="flow-title">
+      <div class="card-head">
+        <h2 id="flow-title">管道视图</h2>
+        <span class="card-hint" id="flow-hint">分发 → 聚合 → 发布</span>
+      </div>
+      <div class="flow" id="flow"></div>
+      <div class="flow-caption" id="flow-caption"></div>
+      <div id="lane-strip"></div>
+      <div class="progress-line">
+        <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+        <span class="progress-label" id="progress-label">—</span>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid two">
+    <section class="card" aria-labelledby="backlog-title">
+      <div class="card-head">
+        <h2 id="backlog-title">积压随时间</h2>
+        <div class="head-tools">
+          <div class="legend" id="backlog-legend"></div>
+          <button class="link-btn" data-table-toggle="backlog">表格</button>
+        </div>
+      </div>
+      <p class="card-hint">每个 tick 所有聚合进程中的最大排队行数；朴素基准与当前运行同源同种子。</p>
+      <div class="chart" id="backlog-chart"></div>
+      <div class="table-wrap hidden" id="backlog-table"></div>
+    </section>
+
+    <section class="card" aria-labelledby="proc-title">
+      <div class="card-head">
+        <h2 id="proc-title">进程流量与状态</h2>
+        <div class="head-tools">
+          <div class="legend" id="proc-legend"></div>
+          <button class="link-btn" data-table-toggle="proc">表格</button>
+        </div>
+      </div>
+      <p class="card-hint">累计接收行数（流量）与保留证据大小（状态）。停滞进程以状态色 + 图标标注。</p>
+      <div class="chart" id="proc-chart"></div>
+      <div class="table-wrap hidden" id="proc-table"></div>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="contrib-title">
+    <div class="card-head">
+      <h2 id="contrib-title">重键的局部贡献与合并</h2>
+      <div class="head-tools">
+        <label class="control-label sr-only" for="contrib-key">查看键</label>
+        <select id="contrib-key"></select>
+        <div class="legend" id="contrib-legend"></div>
+        <button class="link-btn" data-table-toggle="contrib">表格</button>
+      </div>
+    </div>
+    <p class="card-hint" id="contrib-hint">每个拆分片的局部结果，以及按指标规则合并后的最终值。</p>
+    <div class="contrib-layout">
+      <div class="chart tall" id="contrib-chart"></div>
+      <div class="compare" id="compare"></div>
+    </div>
+    <div class="table-wrap hidden" id="contrib-table"></div>
+  </section>
+
+  <div class="grid two">
+    <section class="card" aria-labelledby="results-title">
+      <div class="card-head">
+        <h2 id="results-title">最终结果与真值</h2>
+        <span class="card-hint" id="results-hint"></span>
+      </div>
+      <div class="table-wrap scroll">
+        <table class="data-table" id="results-table">
+          <thead><tr><th>键</th><th class="num">结果</th><th class="num">真值</th><th class="num">误差</th><th class="num">分片</th><th>支撑证据</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="events-title">
+      <div class="card-head">
+        <h2 id="events-title">控制与事件</h2>
+        <span class="card-hint">每个动作都会写入时间线</span>
+      </div>
+      <div class="action-grid">
+        <button class="btn small" data-action="kill">退出工作进程</button>
+        <button class="btn small" data-action="suspend">暂停 / 恢复进程</button>
+        <button class="btn small" data-action="duplicate">重复回报</button>
+        <button class="btn small" data-action="replay-old">旧代局部结果</button>
+        <button class="btn small" data-action="replay-stale-split">旧拆分任务结果</button>
+        <button class="btn small" data-action="replay-orphaned">重放丢失行</button>
+      </div>
+      <p class="card-hint" id="action-note"></p>
+      <div class="table-wrap scroll events" id="event-list"></div>
+    </section>
+  </div>
+
+  <footer class="foot">
+    <span>指标合并规则：计数/求和直接相加 · 均值保留 sum/cnt · 去重数保留成员集合求并。</span>
+    <span id="foot-status"></span>
+  </footer>
+</div>
+<div class="tooltip" id="tooltip" role="status" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>
